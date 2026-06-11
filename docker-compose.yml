@@ -1,0 +1,45 @@
+services:
+  down-streamer:
+    build: .
+    container_name: down-streamer
+    restart: unless-stopped
+    environment:
+      # ─── 核心参数 ───────────────────────────────
+      # 每轮下载间隔（秒），建议 ≥ 20，过低易触发限流
+      - INTERVAL_SEC=30
+      # 每轮目标下载量（MB）
+      - TARGET_MB=100
+      # 总量上限（GB），0 = 无限
+      - MAX_TOTAL_GB=0
+      # ─── 稳定性参数 ─────────────────────────────
+      # 单次下载超时（秒）
+      - TIMEOUT_SEC=60
+      # 连续失败上限 → 触发电路中断（自动暂停后恢复）
+      - MAX_CONSEC_FAIL=5
+      # 间隔抖动系数 0~1（模拟人类行为，防封关键参数）
+      - JITTER_PCT=0.3
+      # ─── 其他 ──────────────────────────────────
+      # 日志级别：DEBUG / INFO / WARNING / ERROR
+      - LOG_LEVEL=INFO
+      # 统计文件路径（映射到卷）
+      - STATS_FILE=/app/data/stats.json
+      # 时区
+      - TZ=Asia/Shanghai
+    volumes:
+      # 统计文件持久化（容器重启不丢失进度）
+      - ./data:/app/data
+    # 资源限制（防止失控）
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    # 日志配置
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # 网络 — 使用 host 网络以获取真实下行带宽
+    # 如需隔离可改为 bridge，但下载速度可能受限
+    network_mode: host
