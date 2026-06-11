@@ -41,6 +41,9 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    # 网络 — 使用 host 网络以获取真实下行带宽
-    # 如需隔离可改为 bridge，但下载速度可能受限
-    network_mode: host
+    networks:
+      - default
+
+networks:
+  default:
+    driver: bridge
