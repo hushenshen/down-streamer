@@ -14,7 +14,6 @@ import json
 import random
 import signal
 import logging
-import hashlib
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -36,30 +35,32 @@ STATS_FILE = os.getenv("STATS_FILE", "/app/data/stats.json")   # 统计文件路
 # 公开测速节点池（全球合法测速文件）
 # ──────────────────────────────────────────────
 SPEED_TEST_SOURCES = [
-    # Cloudflare 边缘节点测速文件
+    # Cloudflare 边缘节点测速文件（动态大小，最可靠）
     {"url": "https://speed.cloudflare.com/__down?bytes={size}", "name": "Cloudflare", "type": "dynamic"},
     # Hetzner 全球测速
     {"url": "https://speed.hetzner.de/1GB.bin", "name": "Hetzner-1GB", "type": "static", "size_mb": 1024},
     {"url": "https://speed.hetzner.de/100MB.bin", "name": "Hetzner-100MB", "type": "static", "size_mb": 100},
-    # Linode 速度测试
-    {"url": "http://speedtest.dallas.linode.com/1GB-dallas.bin", "name": "Linode-Dallas-1GB", "type": "static", "size_mb": 1024},
-    {"url": "http://speedtest.dallas.linode.com/100MB-dallas.bin", "name": "Linode-Dallas-100MB", "type": "static", "size_mb": 100},
-    # Vultr 测速
-    {"url": "http://nj-us-ping.vultr.com/vultr.com.1GB.bin", "name": "Vultr-NJ-1GB", "type": "static", "size_mb": 1024},
-    {"url": "http://nj-us-ping.vultr.com/vultr.com.100MB.bin", "name": "Vultr-NJ-100MB", "type": "static", "size_mb": 100},
+    {"url": "https://speed.hetzner.de/10MB.bin", "name": "Hetzner-10MB", "type": "static", "size_mb": 10},
+    # Vultr 测速（HTTPS）
+    {"url": "https://nj-us-ping.vultr.com/vultr.com.1GB.bin", "name": "Vultr-NJ-1GB", "type": "static", "size_mb": 1024},
+    {"url": "https://nj-us-ping.vultr.com/vultr.com.100MB.bin", "name": "Vultr-NJ-100MB", "type": "static", "size_mb": 100},
     # Cachefly CDN 测速
-    {"url": "http://speedtest.cachefly.net/1mb.test", "name": "Cachefly-1MB", "type": "static", "size_mb": 1},
-    {"url": "http://speedtest.cachefly.net/10mb.test", "name": "Cachefly-10MB", "type": "static", "size_mb": 10},
-    {"url": "http://speedtest.cachefly.net/100mb.test", "name": "Cachefly-100MB", "type": "static", "size_mb": 100},
+    {"url": "https://speedtest.cachefly.net/1mb.test", "name": "Cachefly-1MB", "type": "static", "size_mb": 1},
+    {"url": "https://speedtest.cachefly.net/10mb.test", "name": "Cachefly-10MB", "type": "static", "size_mb": 10},
+    {"url": "https://speedtest.cachefly.net/100mb.test", "name": "Cachefly-100MB", "type": "static", "size_mb": 100},
+    {"url": "https://speedtest.cachefly.net/1000mb.test", "name": "Cachefly-1GB", "type": "static", "size_mb": 1024},
     # OVH 测速
-    {"url": "http://proof.ovh.net/files/100Mb.dat", "name": "OVH-100MB", "type": "static", "size_mb": 100},
-    {"url": "http://proof.ovh.net/files/1Gb.dat", "name": "OVH-1GB", "type": "static", "size_mb": 1024},
-    # DigitalOcean 速度测试
-    {"url": "http://speedtest-sgp1.digitalocean.com/1gb.test", "name": "DO-SGP-1GB", "type": "static", "size_mb": 1024},
-    {"url": "http://speedtest-sgp1.digitalocean.com/100mb.test", "name": "DO-SGP-100MB", "type": "static", "size_mb": 100},
+    {"url": "https://proof.ovh.net/files/100Mb.dat", "name": "OVH-100MB", "type": "static", "size_mb": 100},
+    {"url": "https://proof.ovh.net/files/1Gb.dat", "name": "OVH-1GB", "type": "static", "size_mb": 1024},
     # Leaseweb
-    {"url": "http://mirror.nl.leaseweb.net/speedtest/1000mb.bin", "name": "Leaseweb-1GB", "type": "static", "size_mb": 1024},
-    {"url": "http://mirror.nl.leaseweb.net/speedtest/100mb.bin", "name": "Leaseweb-100MB", "type": "static", "size_mb": 100},
+    {"url": "https://mirror.nl.leaseweb.net/speedtest/1000mb.bin", "name": "Leaseweb-1GB", "type": "static", "size_mb": 1024},
+    {"url": "https://mirror.nl.leaseweb.net/speedtest/100mb.bin", "name": "Leaseweb-100MB", "type": "static", "size_mb": 100},
+    # Bouygues Telecom (法国)
+    {"url": "https://speedtest.bouygues.box.fr/1G.iso", "name": "Bouygues-1GB", "type": "static", "size_mb": 1024},
+    {"url": "https://speedtest.bouygues.box.fr/100M.iso", "name": "Bouygues-100MB", "type": "static", "size_mb": 100},
+    # Scaleway (欧洲)
+    {"url": "https://speedtest.scaleway.com/1GB.bin", "name": "Scaleway-1GB", "type": "static", "size_mb": 1024},
+    {"url": "https://speedtest.scaleway.com/100MB.bin", "name": "Scaleway-100MB", "type": "static", "size_mb": 100},
 ]
 
 # User-Agent 轮换池
