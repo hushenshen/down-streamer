@@ -1,5 +1,6 @@
 services:
   down-streamer:
+    image: deeplakehss/down-streamer:latest
     build: .
     container_name: down-streamer
     restart: unless-stopped
