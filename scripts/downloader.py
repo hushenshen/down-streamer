@@ -167,14 +167,21 @@ log = logging.getLogger("down-streamer")
 # 统计
 # ──────────────────────────────────────────────
 stats = {
+    # 总累计
     "total_bytes": 0,
     "total_gb": 0.0,
+    # 当日累计
+    "daily_bytes": 0,
+    "daily_gb": 0.0,
+    "daily_date": None,  # "YYYY-MM-DD"，用于跨日检测
+    # 计数
     "rounds_completed": 0,
     "downloads_ok": 0,
     "downloads_fail": 0,
     "consec_fail": 0,
     "circuit_breaker_trips": 0,
     "mirror_hits": {},
+    # 时间戳
     "started_at": None,
     "last_activity": None,
 }
@@ -186,7 +193,10 @@ def load_stats():
             with open(p) as f:
                 saved = json.load(f)
                 stats.update(saved)
-                log.info(f"恢复上次统计：已下载 {stats['total_gb']:.2f} GB，完成 {stats['rounds_completed']} 轮")
+                log.info(f"恢复上次统计：总累计 {stats['total_gb']:.2f} GB，完成 {stats['rounds_completed']} 轮")
+                daily = stats.get("daily_date")
+                if daily:
+                    log.info(f"  上次日统计日期: {daily}，当日 {stats.get('daily_gb', 0):.2f} GB")
         except Exception:
             pass
 
@@ -195,6 +205,19 @@ def save_stats():
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w") as f:
         json.dump(stats, f, indent=2)
+
+def check_daily_reset():
+    """检查是否跨日，跨日则重置当日统计"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if stats["daily_date"] != today:
+        if stats["daily_date"] is not None:
+            log.info(
+                f"📅 跨日归零: {stats['daily_date']} 累计 {stats['daily_gb']:.2f} GB → "
+                f"新一天 {today} 从零开始"
+            )
+        stats["daily_bytes"] = 0
+        stats["daily_gb"] = 0.0
+        stats["daily_date"] = today
 
 # ──────────────────────────────────────────────
 # 镜像选择引擎
@@ -532,12 +555,17 @@ def main():
 
     load_stats()
     stats["started_at"] = stats.get("started_at") or datetime.now(timezone.utc).isoformat()
+    # 初始化当日日期
+    check_daily_reset()
 
     health_reset_counter = 0
 
     while running:
         # 时间窗口检查
         wait_for_schedule(schedule)
+
+        # 跨日检测
+        check_daily_reset()
 
         # 电路中断器冷却
         if circuit_breaker_active:
@@ -588,13 +616,16 @@ def main():
 
             stats["total_bytes"] += downloaded
             stats["total_gb"] = stats["total_bytes"] / 1073741824
+            stats["daily_bytes"] += downloaded
+            stats["daily_gb"] = stats["daily_bytes"] / 1073741824
             stats["rounds_completed"] += 1
             stats["downloads_ok"] += 1
             stats["consec_fail"] = 0
             stats["last_activity"] = datetime.now(timezone.utc).isoformat()
 
             log.info(
-                f"📊 累计: {stats['total_gb']:.2f} GB | "
+                f"📊 当日: {stats['daily_gb']:.2f} GB | "
+                f"总累计: {stats['total_gb']:.2f} GB | "
                 f"成功: {stats['downloads_ok']} | 失败: {stats['downloads_fail']}"
             )
 
@@ -624,7 +655,7 @@ def main():
             time.sleep(1)
 
     save_stats()
-    log.info(f"🏁 退出。累计下载: {stats['total_gb']:.2f} GB，共 {stats['rounds_completed']} 轮")
+    log.info(f"🏁 退出。当日: {stats['daily_gb']:.2f} GB | 总累计: {stats['total_gb']:.2f} GB，共 {stats['rounds_completed']} 轮")
 
 
 if __name__ == "__main__":
