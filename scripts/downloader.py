@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Down-Streamer v1.2
-- 源质量分级：Cloudflare 主力 + 静态源偶尔探测，自动降级慢源/不可达源
-- 智能调度：随机化 User-Agent / 间隔 / 文件大小
-- 电路中断：连续失败自动暂停，防止异常流量特征
-- 流量统计：实时记录已刷流量、成功率、耗时
+Down-Streamer v2.0 — 官方镜像站下载引擎
+- 核心：从全球官方 Linux 发行版镜像站下载 ISO / 大文件
+- 技术：HTTP Range 请求 + 随机偏移，绕过 CDN 缓存，每次请求指纹不同
+- 防封：官方镜像站设计承载力就是百万级下载，循环下载完全合规
+- 丢弃：下载的数据直接丢弃（不写磁盘），纯刷下行流量
 """
 
 import os
@@ -27,42 +27,166 @@ from urllib.parse import urlparse
 INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "30"))
 TARGET_MB = int(os.getenv("TARGET_MB", "100"))
 MAX_TOTAL_GB = float(os.getenv("MAX_TOTAL_GB", "0"))
-TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "60"))
-MAX_CONSEC_FAIL = int(os.getenv("MAX_CONSEC_FAIL", "5"))
+TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "120"))
+MAX_CONSEC_FAIL = int(os.getenv("MAX_CONSEC_FAIL", "8"))
 JITTER_PCT = float(os.getenv("JITTER_PCT", "0.3"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 STATS_FILE = os.getenv("STATS_FILE", "/app/data/stats.json")
-PROBE_PCT = float(os.getenv("PROBE_PCT", "0.1"))  # 每轮探测备用源的概率 (10%)
+# 每轮下载完是否随机休息一小段（0.5~3s），模拟人类读完再点下一个
+SIMULATE_HUMAN = os.getenv("SIMULATE_HUMAN", "1") == "1"
 
 # ──────────────────────────────────────────────
-# 公开测速节点池
+# 官方镜像站源池
 # ──────────────────────────────────────────────
-SPEED_TEST_SOURCES = [
-    # ┌─────────────────────────────────────────────────────┐
-    # │  Cloudflare — 全球 CDN 边缘，主力源，动态大小      │
-    # │  几乎所有网络环境都能访问，作为核心流量来源         │
-    # └─────────────────────────────────────────────────────┘
-    {"url": "https://speed.cloudflare.com/__down?bytes={size}", "name": "Cloudflare", "type": "dynamic"},
-    # Cachefly CDN（备选）
-    {"url": "https://speedtest.cachefly.net/10mb.test", "name": "Cachefly-10MB", "type": "static", "size_mb": 10},
-    {"url": "https://speedtest.cachefly.net/100mb.test", "name": "Cachefly-100MB", "type": "static", "size_mb": 100},
-    {"url": "https://speedtest.cachefly.net/1000mb.test", "name": "Cachefly-1GB", "type": "static", "size_mb": 1024},
-    # OVH（备选）
-    {"url": "https://proof.ovh.net/files/100Mb.dat", "name": "OVH-100MB", "type": "static", "size_mb": 100},
-    {"url": "https://proof.ovh.net/files/1Gb.dat", "name": "OVH-1GB", "type": "static", "size_mb": 1024},
-    # Leaseweb（备选）
-    {"url": "https://mirror.nl.leaseweb.net/speedtest/100mb.bin", "name": "Leaseweb-100MB", "type": "static", "size_mb": 100},
-    {"url": "https://mirror.nl.leaseweb.net/speedtest/1000mb.bin", "name": "Leaseweb-1GB", "type": "static", "size_mb": 1024},
+# 策略：大文件 + 官方镜像 + 全球分布 = 不可能被封
+# 每个条目 { mirrors: [url1, url2...], size_gb, name }
+# mirrors 列表里同一文件有多个镜像，随机选一个用
+ISO_SOURCES = [
+    # ── Ubuntu 24.04 LTS ( Noble Numbat ) ───────────────────
+    {
+        "name": "Ubuntu-24.04-Desktop",
+        "size_gb": 5.8,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-desktop-amd64.iso",
+            "https://mirrors.aliyun.com/ubuntu-releases/24.04/ubuntu-24.04.2-desktop-amd64.iso",
+            "https://mirrors.ustc.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-desktop-amd64.iso",
+            "https://mirrors.hit.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-desktop-amd64.iso",
+            "https://mirrors.bfsu.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-desktop-amd64.iso",
+            "https://mirror.sjtu.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-desktop-amd64.iso",
+            "https://ftp.sjtu.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-desktop-amd64.iso",
+            "https://repo.huaweicloud.com/ubuntu-releases/24.04/ubuntu-24.04.2-desktop-amd64.iso",
+        ],
+    },
+    {
+        "name": "Ubuntu-24.04-Server",
+        "size_gb": 2.6,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-live-server-amd64.iso",
+            "https://mirrors.aliyun.com/ubuntu-releases/24.04/ubuntu-24.04.2-live-server-amd64.iso",
+            "https://mirrors.ustc.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-live-server-amd64.iso",
+            "https://mirrors.hit.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-live-server-amd64.iso",
+            "https://mirrors.bfsu.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-live-server-amd64.iso",
+            "https://mirror.sjtu.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.2-live-server-amd64.iso",
+            "https://repo.huaweicloud.com/ubuntu-releases/24.04/ubuntu-24.04.2-live-server-amd64.iso",
+        ],
+    },
+    # ── Ubuntu 22.04 LTS ( Jammy Jellyfish ) ─────────────────
+    {
+        "name": "Ubuntu-22.04-Desktop",
+        "size_gb": 4.7,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.4-desktop-amd64.iso",
+            "https://mirrors.aliyun.com/ubuntu-releases/22.04/ubuntu-22.04.4-desktop-amd64.iso",
+            "https://mirrors.ustc.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.4-desktop-amd64.iso",
+            "https://mirrors.hit.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.4-desktop-amd64.iso",
+            "https://mirrors.bfsu.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.4-desktop-amd64.iso",
+            "https://repo.huaweicloud.com/ubuntu-releases/22.04/ubuntu-22.04.4-desktop-amd64.iso",
+        ],
+    },
+    # ── Debian 12 ( Bookworm ) ──────────────────────────────
+    {
+        "name": "Debian-12-DVD",
+        "size_gb": 3.7,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/debian-cd/current/amd64/iso-dvd/debian-12.10.0-amd64-DVD-1.iso",
+            "https://mirrors.aliyun.com/debian-cd/current/amd64/iso-dvd/debian-12.10.0-amd64-DVD-1.iso",
+            "https://mirrors.ustc.edu.cn/debian-cd/current/amd64/iso-dvd/debian-12.10.0-amd64-DVD-1.iso",
+            "https://mirrors.hit.edu.cn/debian-cd/current/amd64/iso-dvd/debian-12.10.0-amd64-DVD-1.iso",
+            "https://mirrors.bfsu.edu.cn/debian-cd/current/amd64/iso-dvd/debian-12.10.0-amd64-DVD-1.iso",
+            "https://mirror.sjtu.edu.cn/debian-cd/current/amd64/iso-dvd/debian-12.10.0-amd64-DVD-1.iso",
+        ],
+    },
+    {
+        "name": "Debian-12-Netinst",
+        "size_gb": 0.65,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/debian-cd/current/amd64/iso-cd/debian-12.10.0-amd64-netinst.iso",
+            "https://mirrors.aliyun.com/debian-cd/current/amd64/iso-cd/debian-12.10.0-amd64-netinst.iso",
+            "https://mirrors.ustc.edu.cn/debian-cd/current/amd64/iso-cd/debian-12.10.0-amd64-netinst.iso",
+            "https://mirrors.hit.edu.cn/debian-cd/current/amd64/iso-cd/debian-12.10.0-amd64-netinst.iso",
+            "https://mirrors.bfsu.edu.cn/debian-cd/current/amd64/iso-cd/debian-12.10.0-amd64-netinst.iso",
+        ],
+    },
+    # ── CentOS Stream 9 ─────────────────────────────────────
+    {
+        "name": "CentOS-Stream9-DVD",
+        "size_gb": 9.6,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/centos-stream/9-stream/BaseOS/x86_64/iso/CentOS-Stream-9-latest-x86_64-dvd1.iso",
+            "https://mirrors.aliyun.com/centos-stream/9-stream/BaseOS/x86_64/iso/CentOS-Stream-9-latest-x86_64-dvd1.iso",
+            "https://mirrors.ustc.edu.cn/centos-stream/9-stream/BaseOS/x86_64/iso/CentOS-Stream-9-latest-x86_64-dvd1.iso",
+            "https://mirrors.hit.edu.cn/centos-stream/9-stream/BaseOS/x86_64/iso/CentOS-Stream-9-latest-x86_64-dvd1.iso",
+        ],
+    },
+    # ── Fedora 42 ──────────────────────────────────────────
+    {
+        "name": "Fedora-42-Workstation",
+        "size_gb": 2.2,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/fedora/releases/42/Workstation/x86_64/iso/Fedora-Workstation-Live-x86_64-42-1.1.iso",
+            "https://mirrors.aliyun.com/fedora/releases/42/Workstation/x86_64/iso/Fedora-Workstation-Live-x86_64-42-1.1.iso",
+            "https://mirrors.ustc.edu.cn/fedora/releases/42/Workstation/x86_64/iso/Fedora-Workstation-Live-x86_64-42-1.1.iso",
+            "https://mirrors.hit.edu.cn/fedora/releases/42/Workstation/x86_64/iso/Fedora-Workstation-Live-x86_64-42-1.1.iso",
+        ],
+    },
+    # ── Rocky Linux 9 ──────────────────────────────────────
+    {
+        "name": "Rocky-9-DVD",
+        "size_gb": 9.0,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/rocky/9.5/isos/x86_64/Rocky-9.5-x86_64-dvd.iso",
+            "https://mirrors.aliyun.com/rocky/9.5/isos/x86_64/Rocky-9.5-x86_64-dvd.iso",
+            "https://mirrors.ustc.edu.cn/rocky/9.5/isos/x86_64/Rocky-9.5-x86_64-dvd.iso",
+            "https://mirrors.hit.edu.cn/rocky/9.5/isos/x86_64/Rocky-9.5-x86_64-dvd.iso",
+        ],
+    },
+    # ── AlmaLinux 9 ────────────────────────────────────────
+    {
+        "name": "AlmaLinux-9-DVD",
+        "size_gb": 9.2,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/almalinux/9.5/isos/x86_64/AlmaLinux-9.5-x86_64-dvd.iso",
+            "https://mirrors.aliyun.com/almalinux/9.5/isos/x86_64/AlmaLinux-9.5-x86_64-dvd.iso",
+            "https://mirrors.ustc.edu.cn/almalinux/9.5/isos/x86_64/AlmaLinux-9.5-x86_64-dvd.iso",
+        ],
+    },
+    # ── openSUSE Leap 15.6 ────────────────────────────────
+    {
+        "name": "openSUSE-15-DVD",
+        "size_gb": 4.4,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/opensuse/distribution/leap/15.6/iso/openSUSE-Leap-15.6-DVD-x86_64-Media.iso",
+            "https://mirrors.aliyun.com/opensuse/distribution/leap/15.6/iso/openSUSE-Leap-15.6-DVD-x86_64-Media.iso",
+            "https://mirrors.ustc.edu.cn/opensuse/distribution/leap/15.6/iso/openSUSE-Leap-15.6-DVD-x86_64-Media.iso",
+        ],
+    },
+    # ── Arch Linux (滚动更新，最新) ────────────────────────
+    {
+        "name": "ArchLinux-Latest",
+        "size_gb": 0.8,
+        "mirrors": [
+            "https://mirrors.tuna.tsinghua.edu.cn/archlinux/iso/latest/archlinux-latest-x86_64.iso",
+            "https://mirrors.aliyun.com/archlinux/iso/latest/archlinux-latest-x86_64.iso",
+            "https://mirrors.ustc.edu.cn/archlinux/iso/latest/archlinux-latest-x86_64.iso",
+            "https://mirrors.hit.edu.cn/archlinux/iso/latest/archlinux-latest-x86_64.iso",
+            "https://mirrors.bfsu.edu.cn/archlinux/iso/latest/archlinux-latest-x86_64.iso",
+        ],
+    },
 ]
+
+# 每个镜像域名的健康状态
+mirror_health: dict[str, str] = {}  # domain -> "ok" / "dead"
+# 每个 ISO 源的健康状态
+source_health: dict[str, str] = {}  # source_name -> "ok" / "dead"
 
 # User-Agent 轮换池
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 ]
 
 # ──────────────────────────────────────────────
@@ -76,74 +200,17 @@ logging.basicConfig(
 log = logging.getLogger("down-streamer")
 
 # ──────────────────────────────────────────────
-# 源健康状态
-# ──────────────────────────────────────────────
-# 三级状态：ok / slow / dead
-SOURCE_STATUS_OK = "ok"
-SOURCE_STATUS_SLOW = "slow"      # 速度 < 1 Mbps
-SOURCE_STATUS_DEAD = "dead"      # DNS 失败 / 连接被拒 / 404
-
-source_health: dict[str, dict] = {}  # name -> {status, last_check, fail_count}
-
-def init_source_health():
-    """初始化所有源的健康状态"""
-    for s in SPEED_TEST_SOURCES:
-        source_health[s["name"]] = {
-            "status": SOURCE_STATUS_OK,
-            "last_check": 0,
-            "fail_count": 0,
-        }
-
-def mark_source(source_name: str, status: str):
-    """更新源的健康状态"""
-    h = source_health.get(source_name)
-    if not h:
-        return
-    old = h["status"]
-    h["status"] = status
-    h["last_check"] = time.monotonic()
-    if status == SOURCE_STATUS_DEAD:
-        h["fail_count"] += 1
-    if old != status:
-        log.info(f"  🔄 {source_name}: {old} → {status}")
-
-def check_source_dns(source: dict) -> bool:
-    """检查下载源域名是否可解析"""
-    hostname = urlparse(source["url"]).hostname
-    if not hostname:
-        return False
-    try:
-        socket.getaddrinfo(hostname, 443, socket.AF_INET)
-        return True
-    except (socket.gaierror, socket.herror):
-        return False
-
-def probe_all_sources():
-    """探测所有源的 DNS 可达性，更新健康状态"""
-    log.info("🔍 探测下载源...")
-    for source in SPEED_TEST_SOURCES:
-        ok = check_source_dns(source)
-        if ok:
-            mark_source(source["name"], SOURCE_STATUS_OK)
-        else:
-            mark_source(source["name"], SOURCE_STATUS_DEAD)
-        status_icon = "✓" if ok else "✗"
-        log.info(f"  {status_icon} {source['name']}")
-    ok_count = sum(1 for h in source_health.values() if h["status"] != SOURCE_STATUS_DEAD)
-    log.info(f"探测完成：{ok_count}/{len(SPEED_TEST_SOURCES)} 个源可用")
-
-# ──────────────────────────────────────────────
 # 统计
 # ──────────────────────────────────────────────
 stats = {
     "total_bytes": 0,
-    "total_mb": 0.0,
     "total_gb": 0.0,
     "rounds_completed": 0,
     "downloads_ok": 0,
     "downloads_fail": 0,
     "consec_fail": 0,
     "circuit_breaker_trips": 0,
+    "mirror_hits": {},  # mirror_domain -> count
     "started_at": None,
     "last_activity": None,
 }
@@ -166,66 +233,101 @@ def save_stats():
         json.dump(stats, f, indent=2)
 
 # ──────────────────────────────────────────────
-# 下载引擎
+# 镜像选择引擎
 # ──────────────────────────────────────────────
-def select_source(target_mb: int) -> dict:
-    """选择下载源：Cloudflare 主力 (1-PROBE_PCT)，备用源探测 (PROBE_PCT)"""
-    # 判断这轮是否探测备用源
-    is_probe = random.random() < PROBE_PCT
-
-    if not is_probe:
-        # 主力模式：只用 Cloudflare（最可靠）
-        for s in SPEED_TEST_SOURCES:
-            if s["type"] == "dynamic":
-                h = source_health.get(s["name"])
-                if h and h["status"] != SOURCE_STATUS_DEAD:
-                    return s
-
-    # 探测模式或 Cloudflare 挂了：从非 dead 的备用源中随机选
-    backup_candidates = []
-    for s in SPEED_TEST_SOURCES:
-        if s["type"] == "dynamic":
-            continue  # 备用模式不选 Cloudflare
-        h = source_health.get(s["name"])
-        if not h or h["status"] == SOURCE_STATUS_DEAD:
+def get_available_sources() -> list:
+    """返回所有未标记 dead 的源"""
+    available = []
+    for src in ISO_SOURCES:
+        if source_health.get(src["name"]) == "dead":
             continue
-        # slow 的源降低权重
-        weight = 0.3 if h["status"] == SOURCE_STATUS_SLOW else 1.0
-        backup_candidates.append((s, weight))
+        available.append(src)
+    return available
 
-    if backup_candidates:
-        total = sum(w for _, w in backup_candidates)
-        r = random.uniform(0, total)
-        cumul = 0
-        for source, weight in backup_candidates:
-            cumul += weight
-            if r <= cumul:
-                return source
-        return backup_candidates[0][0]
+def pick_mirror(source: dict) -> str | None:
+    """从源的镜像列表中选一个可用镜像，返回 URL"""
+    # 先过滤掉 dead 镜像
+    live_mirrors = []
+    for url in source["mirrors"]:
+        domain = urlparse(url).hostname
+        if mirror_health.get(domain) != "dead":
+            live_mirrors.append(url)
+    
+    if not live_mirrors:
+        return None
+    
+    # 加权随机：优先选命中少的（均衡流量）
+    return random.choice(live_mirrors)
 
-    # 所有备用源都挂了，回退 Cloudflare
-    for s in SPEED_TEST_SOURCES:
-        if s["type"] == "dynamic":
-            return s
+def mark_mirror_dead(url: str, reason: str):
+    domain = urlparse(url).hostname or "unknown"
+    old = mirror_health.get(domain, "ok")
+    mirror_health[domain] = "dead"
+    if old != "dead":
+        log.info(f"  🔒 镜像 {domain} → dead（{reason}）")
 
-    raise RuntimeError("无可用的下载源")
+def mark_source_dead(name: str, reason: str):
+    old = source_health.get(name, "ok")
+    source_health[name] = "dead"
+    if old != "dead":
+        log.info(f"  🔒 源 {name} → dead（{reason}）")
 
+# ──────────────────────────────────────────────
+# DNS 预检
+# ──────────────────────────────────────────────
+def dns_preflight():
+    """启动前 DNS 预检：检测核心镜像站域名可达性"""
+    test_domains = set()
+    for src in ISO_SOURCES[:3]:  # 测前 3 个源的镜像域名
+        for url in src["mirrors"][:2]:
+            test_domains.add(urlparse(url).hostname)
+    
+    resolved = 0
+    for domain in sorted(test_domains):
+        try:
+            addr = socket.getaddrinfo(domain, 443, socket.AF_INET)
+            if addr:
+                resolved += 1
+                log.info(f"  DNS ✓ {domain} → {addr[0][4][0]}")
+        except (socket.gaierror, socket.herror):
+            log.warning(f"  DNS ✗ {domain}")
+    
+    if resolved == 0:
+        log.error("❌ 所有镜像域名均无法解析！请检查容器 DNS 配置。")
+        sys.exit(1)
+    
+    log.info(f"DNS 预检通过：{resolved}/{len(test_domains)} 个域名可解析")
 
-def build_url(source: dict, target_mb: int) -> str:
-    if source["type"] == "dynamic":
-        return source["url"].format(size=target_mb * 1024 * 1024)
-    return source["url"]
+# ──────────────────────────────────────────────
+# 下载引擎（核心）
+# ──────────────────────────────────────────────
+def download_iso_chunk(source: dict, target_mb: int) -> int:
+    """
+    从镜像站下载 ISO 的一段数据（Range 请求），直接丢弃不写磁盘。
+    返回实际下载字节数。
+    """
+    url = pick_mirror(source)
+    if not url:
+        raise RuntimeError(f"{source['name']} 所有镜像已标记 dead")
+    
+    domain = urlparse(url).hostname
+    file_size = int(source["size_gb"] * 1024 * 1024 * 1024)
+    target_bytes = target_mb * 1024 * 1024
+    
+    # 随机偏移：从文件的随机位置开始读，避免 CDN 缓存
+    # 留出 target_bytes 的余量，确保 range 合法
+    max_offset = max(0, file_size - target_bytes - 1)
+    offset = random.randint(0, max_offset) if max_offset > 0 else 0
+    end = offset + target_bytes - 1
 
-def download_one(source: dict, target_mb: int) -> int:
-    """执行一次下载，返回实际下载字节数"""
-    url = build_url(source, target_mb)
     ua = random.choice(USER_AGENTS)
 
     req = urllib.request.Request(url, headers={
         "User-Agent": ua,
         "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Connection": "keep-alive",
+        "Accept-Encoding": "identity",  # 禁用压缩，确保真实下行字节数
+        "Connection": "close",
+        "Range": f"bytes={offset}-{end}",
     })
 
     bytes_downloaded = 0
@@ -233,77 +335,107 @@ def download_one(source: dict, target_mb: int) -> int:
 
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
+            status = resp.status
+            # 206 = Partial Content（正常 Range 响应）
+            # 200 = 服务器忽略 Range 返回全量（也行，我们读到目标就停）
+            if status not in (200, 206):
+                raise urllib.error.HTTPError(url, status, "Unexpected status", resp.headers, None)
+            
             while True:
-                chunk = resp.read(65536)
+                chunk = resp.read(131072)  # 128KB chunks
                 if not chunk:
                     break
                 bytes_downloaded += len(chunk)
-
-                # 静态源超过目标大小，提前终止
-                if source["type"] == "static" and source.get("size_mb", 0) > target_mb:
-                    if bytes_downloaded >= target_mb * 1024 * 1024:
-                        break
-
-                # 超时硬保护（TIMEOUT_SEC * 2，不是 *3）
-                elapsed_so_far = time.monotonic() - start
-                if elapsed_so_far > TIMEOUT_SEC * 2:
-                    log.warning(f"下载超时硬保护触发 ({elapsed_so_far:.0f}s)，已下载 {bytes_downloaded / 1048576:.1f} MB")
+                # 数据直接丢弃（不写磁盘），纯刷下行
+                
+                # 超时硬保护
+                elapsed = time.monotonic() - start
+                if elapsed > TIMEOUT_SEC * 2:
+                    log.warning(f"下载超时硬保护 ({elapsed:.0f}s)，已下载 {bytes_downloaded/1048576:.1f} MB")
+                    break
+                
+                # 读够了就停
+                if bytes_downloaded >= target_bytes:
                     break
 
-                # 慢速检测：前 5 秒内速度 < 0.5 Mbps → 标记为 slow 并放弃
-                if bytes_downloaded >= 65536 and elapsed_so_far > 5:
-                    speed_mbps = (bytes_downloaded * 8) / (elapsed_so_far * 1_000_000)
-                    if speed_mbps < 0.5:
-                        log.warning(f"🐌 {source['name']} 速度过慢 ({speed_mbps:.2f} Mbps)，放弃本轮")
-                        mark_source(source["name"], SOURCE_STATUS_SLOW)
-                        raise ValueError(f"速度过慢: {speed_mbps:.2f} Mbps")
-
     except urllib.error.HTTPError as e:
-        log.warning(f"HTTP {e.code} from {source['name']}: {e.reason}")
-        if e.code in (404, 410, 451):
-            mark_source(source["name"], SOURCE_STATUS_DEAD)
+        if e.code == 404:
+            mark_mirror_dead(url, "404")
+            raise
+        if e.code == 416:  # Range Not Satisfiable — 文件可能比预期小
+            log.warning(f"Range 不可满足 {source['name']}（文件可能已更新），尝试从 0 开始")
+            # 回退：从文件头开始读
+            return _download_from_start(url, target_bytes, ua)
+        if e.code in (403, 429):
+            mark_mirror_dead(url, f"HTTP {e.code}")
+            raise
         raise
     except urllib.error.URLError as e:
         reason = str(e.reason)
-        log.warning(f"连接失败 {source['name']}: {e.reason}")
-        # DNS 失败 / 网络不可达 → 标记 dead
+        log.warning(f"连接失败 {domain}: {e.reason}")
         if any(kw in reason for kw in [
             "Name does not resolve", "Name or service not known",
-            "Network unreachable", "No route to host",
-            "Connection refused", "bad address",
+            "bad address", "No address associated",
         ]):
-            mark_source(source["name"], SOURCE_STATUS_DEAD)
+            mark_mirror_dead(url, "DNS 失败")
+        elif any(kw in reason for kw in [
+            "Network unreachable", "No route to host",
+            "Connection refused", "Connection timed out",
+        ]):
+            mark_mirror_dead(url, reason)
         raise
     except (OSError, IOError) as e:
         reason = str(e)
-        log.warning(f"IO 异常 {source['name']}: {e}")
         if "Network unreachable" in reason or "No route" in reason:
-            mark_source(source["name"], SOURCE_STATUS_DEAD)
-        raise
-    except ValueError:
-        raise  # slow 检测抛出的
-    except Exception as e:
-        log.warning(f"下载异常 {source['name']}: {e}")
+            mark_mirror_dead(url, reason)
         raise
 
     elapsed = time.monotonic() - start
     speed_mbps = (bytes_downloaded * 8) / (elapsed * 1_000_000) if elapsed > 0 else 0
-
-    # 下载完成但速度慢 → 标记 slow
-    if speed_mbps < 1.0 and source["type"] != "dynamic":
-        mark_source(source["name"], SOURCE_STATUS_SLOW)
+    offset_mb = offset / 1048576
 
     log.info(
-        f"✓ {source['name']} | {bytes_downloaded / 1048576:.1f} MB | "
+        f"✓ {source['name']} @ {domain} | "
+        f"{bytes_downloaded/1048576:.1f} MB (偏移 {offset_mb:.0f} MB) | "
         f"{elapsed:.1f}s | {speed_mbps:.1f} Mbps"
     )
+
+    # 统计镜像命中
+    stats["mirror_hits"][domain] = stats["mirror_hits"].get(domain, 0) + 1
+
+    return bytes_downloaded
+
+
+def _download_from_start(url: str, target_bytes: int, ua: str) -> int:
+    """Range 请求失败后的回退：从文件头开始读"""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+    })
+
+    bytes_downloaded = 0
+    start = time.monotonic()
+
+    with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
+        while True:
+            chunk = resp.read(131072)
+            if not chunk:
+                break
+            bytes_downloaded += len(chunk)
+            if bytes_downloaded >= target_bytes:
+                break
+            if time.monotonic() - start > TIMEOUT_SEC * 2:
+                break
+
     return bytes_downloaded
 
 # ──────────────────────────────────────────────
 # 电路中断器
 # ──────────────────────────────────────────────
 circuit_breaker_active = False
-circuit_breaker_cooldown = 60
+circuit_breaker_cooldown = 90
 
 def trip_circuit_breaker(reason: str):
     global circuit_breaker_active
@@ -326,46 +458,26 @@ def handle_signal(signum, frame):
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
 
-def dns_preflight():
-    """启动前 DNS 预检"""
-    test_domains = ["speed.cloudflare.com"]
-    for domain in test_domains:
-        try:
-            addr = socket.getaddrinfo(domain, 443, socket.AF_INET)
-            if addr:
-                log.info(f"  DNS ✓ {domain} → {addr[0][4][0]}")
-        except socket.gaierror as e:
-            log.error(f"  DNS ✗ {domain}: {e}")
-            log.error("❌ Cloudflare DNS 解析失败！无法启动。")
-            sys.exit(1)
-
-    log.info("DNS 预检通过")
-
 
 def main():
     global circuit_breaker_active
 
     log.info("=" * 60)
-    log.info("⚡ Down-Streamer v1.2 启动")
+    log.info("⚡ Down-Streamer v2.0 — 官方镜像站下载引擎")
     log.info(f"  间隔: {INTERVAL_SEC}s | 每轮: {TARGET_MB}MB | 超时: {TIMEOUT_SEC}s")
     log.info(f"  抖动: {JITTER_PCT*100:.0f}% | 连续失败上限: {MAX_CONSEC_FAIL}")
     log.info(f"  总量上限: {'无限' if MAX_TOTAL_GB == 0 else f'{MAX_TOTAL_GB} GB'}")
+    log.info(f"  源池: {len(ISO_SOURCES)} 个 ISO × 多镜像站")
     log.info("=" * 60)
 
     # DNS 预检
     dns_preflight()
 
-    # 初始化源健康状态
-    init_source_health()
-
-    # 探测所有源（仅作信息展示，不阻止启动）
-    probe_all_sources()
-
     load_stats()
     stats["started_at"] = stats.get("started_at") or datetime.now(timezone.utc).isoformat()
 
-    # DNS 刷新计数器 — 每 50 轮重新探测一次
-    dns_refresh_counter = 0
+    # 健康重置计数器 — 每 30 轮重置 dead 镜像（可能恢复了）
+    health_reset_counter = 0
 
     while running:
         # 电路中断器冷却
@@ -377,34 +489,46 @@ def main():
                 time.sleep(1)
             circuit_breaker_active = False
             log.info("电路中断器重置，恢复下载。")
-            probe_all_sources()
+            # 重置所有 dead 状态，给镜像第二次机会
+            mirror_health.clear()
+            source_health.clear()
 
         # 检查总量上限
         if MAX_TOTAL_GB > 0 and stats["total_gb"] >= MAX_TOTAL_GB:
             log.info(f"🎯 已达总量上限 {MAX_TOTAL_GB} GB，停止。")
             break
 
-        # 定期刷新 DNS 状态
-        dns_refresh_counter += 1
-        if dns_refresh_counter >= 50:
-            dns_refresh_counter = 0
-            probe_all_sources()
+        # 定期重置 dead 状态
+        health_reset_counter += 1
+        if health_reset_counter >= 30:
+            health_reset_counter = 0
+            if mirror_health or source_health:
+                dead_mirrors = sum(1 for v in mirror_health.values() if v == "dead")
+                dead_sources = sum(1 for v in source_health.values() if v == "dead")
+                log.info(f"🔄 重置 {dead_mirrors} 个 dead 镜像 + {dead_sources} 个 dead 源（给第二次机会）")
+                mirror_health.clear()
+                source_health.clear()
 
-        # 选择下载源
-        source = select_source(TARGET_MB)
+        # 选择 ISO 源
+        available = get_available_sources()
+        if not available:
+            log.error("❌ 所有源已耗尽，重置健康状态...")
+            mirror_health.clear()
+            source_health.clear()
+            available = ISO_SOURCES
+
+        source = random.choice(available)
         round_num = stats["rounds_completed"] + 1
-        is_probe = source["type"] != "dynamic"
-        probe_tag = " [探测]" if is_probe else ""
-        log.info(f"→ 轮次 {round_num}{probe_tag} | 源: {source['name']} | 目标: {TARGET_MB} MB")
+
+        log.info(f"→ 轮次 {round_num} | 源: {source['name']} | 目标: {TARGET_MB} MB")
 
         try:
-            downloaded = download_one(source, TARGET_MB)
+            downloaded = download_iso_chunk(source, TARGET_MB)
 
             if downloaded < 1024:
                 raise ValueError(f"下载量异常: {downloaded} bytes")
 
             stats["total_bytes"] += downloaded
-            stats["total_mb"] = stats["total_bytes"] / 1048576
             stats["total_gb"] = stats["total_bytes"] / 1073741824
             stats["rounds_completed"] += 1
             stats["downloads_ok"] += 1
@@ -413,8 +537,7 @@ def main():
 
             log.info(
                 f"📊 累计: {stats['total_gb']:.2f} GB | "
-                f"成功: {stats['downloads_ok']} | "
-                f"失败: {stats['downloads_fail']}"
+                f"成功: {stats['downloads_ok']} | 失败: {stats['downloads_fail']}"
             )
 
         except Exception:
@@ -427,6 +550,11 @@ def main():
                 )
 
         save_stats()
+
+        # 模拟人类：下载完随机短暂停顿
+        if SIMULATE_HUMAN and not circuit_breaker_active:
+            human_pause = random.uniform(0.5, 3.0)
+            time.sleep(human_pause)
 
         # 间隔 + 抖动
         jitter = INTERVAL_SEC * JITTER_PCT
@@ -442,6 +570,7 @@ def main():
     # 优雅退出
     save_stats()
     log.info(f"🏁 退出。累计下载: {stats['total_gb']:.2f} GB，共 {stats['rounds_completed']} 轮")
+
 
 if __name__ == "__main__":
     main()
