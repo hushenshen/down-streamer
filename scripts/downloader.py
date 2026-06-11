@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Down-Streamer v1.0
+Down-Streamer v1.1
 - 多源轮换：从全球公开测速节点下载，避免单点封锁
+- 动态 DNS 健康检查：启动时探测所有源，运行时自动跳过死源
 - 智能调度：随机化 User-Agent / 间隔 / 文件大小
 - 电路中断：连续失败自动暂停，防止异常流量特征
 - 流量统计：实时记录已刷流量、成功率、耗时
@@ -19,6 +20,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 # ──────────────────────────────────────────────
 # 配置（从环境变量注入）
@@ -33,29 +35,30 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")                   # 日志级别
 STATS_FILE = os.getenv("STATS_FILE", "/app/data/stats.json")   # 统计文件路径
 
 # ──────────────────────────────────────────────
-# 公开测速节点池（全球合法测速文件）
+# 公开测速节点池
 # ──────────────────────────────────────────────
 SPEED_TEST_SOURCES = [
-    # Cloudflare 边缘节点测速文件（动态大小，最可靠）
-    {"url": "https://speed.cloudflare.com/__down?bytes={size}", "name": "Cloudflare", "type": "dynamic"},
-    # Hetzner 全球测速
-    {"url": "https://speed.hetzner.de/1GB.bin", "name": "Hetzner-1GB", "type": "static", "size_mb": 1024},
-    {"url": "https://speed.hetzner.de/100MB.bin", "name": "Hetzner-100MB", "type": "static", "size_mb": 100},
-    {"url": "https://speed.hetzner.de/10MB.bin", "name": "Hetzner-10MB", "type": "static", "size_mb": 10},
+    # ┌─────────────────────────────────────────────┐
+    # │  Cloudflare — 主力源，全球 CDN，动态大小    │
+    # └─────────────────────────────────────────────┘
+    {"url": "https://speed.cloudflare.com/__down?bytes={size}", "name": "Cloudflare", "type": "dynamic", "priority": 1.0},
     # Cachefly CDN 测速
-    {"url": "https://speedtest.cachefly.net/1mb.test", "name": "Cachefly-1MB", "type": "static", "size_mb": 1},
-    {"url": "https://speedtest.cachefly.net/10mb.test", "name": "Cachefly-10MB", "type": "static", "size_mb": 10},
-    {"url": "https://speedtest.cachefly.net/100mb.test", "name": "Cachefly-100MB", "type": "static", "size_mb": 100},
-    {"url": "https://speedtest.cachefly.net/1000mb.test", "name": "Cachefly-1GB", "type": "static", "size_mb": 1024},
+    {"url": "https://speedtest.cachefly.net/10mb.test", "name": "Cachefly-10MB", "type": "static", "size_mb": 10, "priority": 0.6},
+    {"url": "https://speedtest.cachefly.net/100mb.test", "name": "Cachefly-100MB", "type": "static", "size_mb": 100, "priority": 0.6},
+    {"url": "https://speedtest.cachefly.net/1000mb.test", "name": "Cachefly-1GB", "type": "static", "size_mb": 1024, "priority": 0.6},
     # OVH 测速
-    {"url": "https://proof.ovh.net/files/100Mb.dat", "name": "OVH-100MB", "type": "static", "size_mb": 100},
-    {"url": "https://proof.ovh.net/files/1Gb.dat", "name": "OVH-1GB", "type": "static", "size_mb": 1024},
+    {"url": "https://proof.ovh.net/files/100Mb.dat", "name": "OVH-100MB", "type": "static", "size_mb": 100, "priority": 0.5},
+    {"url": "https://proof.ovh.net/files/1Gb.dat", "name": "OVH-1GB", "type": "static", "size_mb": 1024, "priority": 0.5},
     # Leaseweb
-    {"url": "https://mirror.nl.leaseweb.net/speedtest/1000mb.bin", "name": "Leaseweb-1GB", "type": "static", "size_mb": 1024},
-    {"url": "https://mirror.nl.leaseweb.net/speedtest/100mb.bin", "name": "Leaseweb-100MB", "type": "static", "size_mb": 100},
+    {"url": "https://mirror.nl.leaseweb.net/speedtest/100mb.bin", "name": "Leaseweb-100MB", "type": "static", "size_mb": 100, "priority": 0.5},
+    {"url": "https://mirror.nl.leaseweb.net/speedtest/1000mb.bin", "name": "Leaseweb-1GB", "type": "static", "size_mb": 1024, "priority": 0.5},
     # Scaleway (欧洲)
-    {"url": "https://speedtest.scaleway.com/1GB.bin", "name": "Scaleway-1GB", "type": "static", "size_mb": 1024},
-    {"url": "https://speedtest.scaleway.com/100MB.bin", "name": "Scaleway-100MB", "type": "static", "size_mb": 100},
+    {"url": "https://speedtest.scaleway.com/100MB.bin", "name": "Scaleway-100MB", "type": "static", "size_mb": 100, "priority": 0.4},
+    {"url": "https://speedtest.scaleway.com/1GB.bin", "name": "Scaleway-1GB", "type": "static", "size_mb": 1024, "priority": 0.4},
+    # Hetzner（部分网络环境 DNS 受限，作低优先级备选）
+    {"url": "https://speed.hetzner.de/10MB.bin", "name": "Hetzner-10MB", "type": "static", "size_mb": 10, "priority": 0.2},
+    {"url": "https://speed.hetzner.de/100MB.bin", "name": "Hetzner-100MB", "type": "static", "size_mb": 100, "priority": 0.2},
+    {"url": "https://speed.hetzner.de/1GB.bin", "name": "Hetzner-1GB", "type": "static", "size_mb": 1024, "priority": 0.2},
 ]
 
 # User-Agent 轮换池
@@ -77,6 +80,47 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("down-streamer")
+
+# ──────────────────────────────────────────────
+# 源健康检查
+# ──────────────────────────────────────────────
+# 记录每个源的 DNS 是否可达
+source_dns_ok: dict[str, bool] = {}
+
+def check_source_dns(source: dict) -> bool:
+    """检查下载源域名是否可解析"""
+    hostname = urlparse(source["url"]).hostname
+    if not hostname:
+        return False
+    try:
+        socket.getaddrinfo(hostname, 443, socket.AF_INET)
+        return True
+    except (socket.gaierror, socket.herror):
+        return False
+
+def probe_all_sources():
+    """启动时探测所有源的 DNS 可达性"""
+    log.info("🔍 探测下载源 DNS 可达性...")
+    for source in SPEED_TEST_SOURCES:
+        ok = check_source_dns(source)
+        source_dns_ok[source["name"]] = ok
+        status = "✓" if ok else "✗"
+        log.info(f"  {status} {source['name']}")
+    healthy = sum(1 for v in source_dns_ok.values() if v)
+    log.info(f"探测完成：{healthy}/{len(SPEED_TEST_SOURCES)} 个源可用")
+
+def refresh_source_dns(source_name: str):
+    """重新探测某个源的 DNS（失败后重试用）"""
+    for source in SPEED_TEST_SOURCES:
+        if source["name"] == source_name:
+            ok = check_source_dns(source)
+            was_ok = source_dns_ok.get(source_name, False)
+            source_dns_ok[source_name] = ok
+            if ok and not was_ok:
+                log.info(f"🔄 {source_name} DNS 恢复")
+            elif not ok and was_ok:
+                log.warning(f"🔄 {source_name} DNS 失效")
+            break
 
 # ──────────────────────────────────────────────
 # 统计
@@ -115,24 +159,30 @@ def save_stats():
 # 下载引擎
 # ──────────────────────────────────────────────
 def select_source(target_mb: int) -> dict:
-    """智能选择下载源：优先匹配目标大小，加随机轮换"""
+    """智能选择下载源：仅从 DNS 可达的源中选择，按权重随机"""
     candidates = []
 
     # Cloudflare 动态源 — 可精确控制大小
     for s in SPEED_TEST_SOURCES:
+        if not source_dns_ok.get(s["name"], False):
+            continue
         if s["type"] == "dynamic":
-            candidates.append((s, 1.0))  # 最高优先级
+            candidates.append((s, s.get("priority", 1.0) * 1.5))  # 动态源加权
+        elif s.get("size_mb", 0) >= target_mb:
+            candidates.append((s, s.get("priority", 0.5)))
+        else:
+            candidates.append((s, s.get("priority", 0.3) * 0.5))
 
-    # 静态源 — 选大小 >= target 的
-    for s in SPEED_TEST_SOURCES:
-        if s["type"] == "static" and s.get("size_mb", 0) >= target_mb:
-            candidates.append((s, 0.8))
-
-    # 如果没有足够大的静态源，退而求其次
-    if not any(c[1] == 0.8 for c in candidates):
+    if not candidates:
+        # 极端情况：所有源 DNS 都挂了，强制用 Cloudflare 再试一次
         for s in SPEED_TEST_SOURCES:
-            if s["type"] == "static":
-                candidates.append((s, 0.5))
+            if s["type"] == "dynamic":
+                log.warning("所有源 DNS 不可达，尝试 Cloudflare 直连...")
+                candidates.append((s, 1.0))
+                break
+
+    if not candidates:
+        raise RuntimeError("无可用的下载源")
 
     # 按权重随机选择
     total_weight = sum(w for _, w in candidates)
@@ -189,6 +239,10 @@ def download_one(source: dict, target_mb: int) -> int:
         raise
     except urllib.error.URLError as e:
         log.warning(f"连接失败 {source['name']}: {e.reason}")
+        # DNS 解析失败的源标记为不可达
+        if "Name or service not known" in str(e.reason) or "Name does not resolve" in str(e.reason):
+            source_dns_ok[source["name"]] = False
+            log.info(f"  → 已标记 {source['name']} 为 DNS 不可达")
         raise
     except Exception as e:
         log.warning(f"下载异常 {source['name']}: {e}")
@@ -233,8 +287,8 @@ def dns_preflight():
     """启动前 DNS 预检：确认能解析至少一个下载源域名"""
     test_domains = [
         "speed.cloudflare.com",
-        "speed.hetzner.de",
         "speedtest.cachefly.net",
+        "proof.ovh.net",
     ]
     resolved = 0
     for domain in test_domains:
@@ -258,7 +312,7 @@ def main():
     global circuit_breaker_active
 
     log.info("=" * 60)
-    log.info("⚡ Down-Streamer v1.0 启动")
+    log.info("⚡ Down-Streamer v1.1 启动")
     log.info(f"  间隔: {INTERVAL_SEC}s | 每轮: {TARGET_MB}MB | 超时: {TIMEOUT_SEC}s")
     log.info(f"  抖动: {JITTER_PCT*100:.0f}% | 连续失败上限: {MAX_CONSEC_FAIL}")
     log.info(f"  总量上限: {'无限' if MAX_TOTAL_GB == 0 else f'{MAX_TOTAL_GB} GB'}")
@@ -267,8 +321,20 @@ def main():
     # DNS 预检
     dns_preflight()
 
+    # 探测所有源
+    probe_all_sources()
+
+    # 确保至少有一个源可用
+    available = sum(1 for v in source_dns_ok.values() if v)
+    if available == 0:
+        log.error("❌ 所有下载源不可达！退出。")
+        sys.exit(1)
+
     load_stats()
     stats["started_at"] = stats.get("started_at") or datetime.now(timezone.utc).isoformat()
+
+    # DNS 刷新计数器 — 每 20 轮重新探测一次 DNS
+    dns_refresh_counter = 0
 
     while running:
         # 电路中断器冷却
@@ -280,11 +346,19 @@ def main():
                 time.sleep(1)
             circuit_breaker_active = False
             log.info("电路中断器重置，恢复下载。")
+            # 重新探测 DNS
+            probe_all_sources()
 
         # 检查总量上限
         if MAX_TOTAL_GB > 0 and stats["total_gb"] >= MAX_TOTAL_GB:
             log.info(f"🎯 已达总量上限 {MAX_TOTAL_GB} GB，停止。")
             break
+
+        # 定期刷新 DNS 状态
+        dns_refresh_counter += 1
+        if dns_refresh_counter >= 20:
+            dns_refresh_counter = 0
+            probe_all_sources()
 
         # 选择下载源
         source = select_source(TARGET_MB)
@@ -313,6 +387,9 @@ def main():
         except Exception:
             stats["downloads_fail"] += 1
             stats["consec_fail"] += 1
+
+            # DNS 失败的源，尝试刷新其 DNS 状态
+            refresh_source_dns(source["name"])
 
             if stats["consec_fail"] >= MAX_CONSEC_FAIL:
                 trip_circuit_breaker(
