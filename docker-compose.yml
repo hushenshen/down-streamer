@@ -23,10 +23,6 @@ services:
       - LOG_LEVEL=INFO
       # 时区
       - TZ=Asia/Shanghai
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-      - 223.5.5.5
     volumes:
       # 统计文件持久化（容器重启不丢失进度）
       - ./data:/app/data

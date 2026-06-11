@@ -13,6 +13,7 @@ import time
 import json
 import random
 import signal
+import socket
 import logging
 import urllib.request
 import urllib.error
@@ -41,9 +42,6 @@ SPEED_TEST_SOURCES = [
     {"url": "https://speed.hetzner.de/1GB.bin", "name": "Hetzner-1GB", "type": "static", "size_mb": 1024},
     {"url": "https://speed.hetzner.de/100MB.bin", "name": "Hetzner-100MB", "type": "static", "size_mb": 100},
     {"url": "https://speed.hetzner.de/10MB.bin", "name": "Hetzner-10MB", "type": "static", "size_mb": 10},
-    # Vultr 测速（HTTPS）
-    {"url": "https://nj-us-ping.vultr.com/vultr.com.1GB.bin", "name": "Vultr-NJ-1GB", "type": "static", "size_mb": 1024},
-    {"url": "https://nj-us-ping.vultr.com/vultr.com.100MB.bin", "name": "Vultr-NJ-100MB", "type": "static", "size_mb": 100},
     # Cachefly CDN 测速
     {"url": "https://speedtest.cachefly.net/1mb.test", "name": "Cachefly-1MB", "type": "static", "size_mb": 1},
     {"url": "https://speedtest.cachefly.net/10mb.test", "name": "Cachefly-10MB", "type": "static", "size_mb": 10},
@@ -55,9 +53,6 @@ SPEED_TEST_SOURCES = [
     # Leaseweb
     {"url": "https://mirror.nl.leaseweb.net/speedtest/1000mb.bin", "name": "Leaseweb-1GB", "type": "static", "size_mb": 1024},
     {"url": "https://mirror.nl.leaseweb.net/speedtest/100mb.bin", "name": "Leaseweb-100MB", "type": "static", "size_mb": 100},
-    # Bouygues Telecom (法国)
-    {"url": "https://speedtest.bouygues.box.fr/1G.iso", "name": "Bouygues-1GB", "type": "static", "size_mb": 1024},
-    {"url": "https://speedtest.bouygues.box.fr/100M.iso", "name": "Bouygues-100MB", "type": "static", "size_mb": 100},
     # Scaleway (欧洲)
     {"url": "https://speedtest.scaleway.com/1GB.bin", "name": "Scaleway-1GB", "type": "static", "size_mb": 1024},
     {"url": "https://speedtest.scaleway.com/100MB.bin", "name": "Scaleway-100MB", "type": "static", "size_mb": 100},
@@ -234,6 +229,31 @@ def handle_signal(signum, frame):
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
 
+def dns_preflight():
+    """启动前 DNS 预检：确认能解析至少一个下载源域名"""
+    test_domains = [
+        "speed.cloudflare.com",
+        "speed.hetzner.de",
+        "speedtest.cachefly.net",
+    ]
+    resolved = 0
+    for domain in test_domains:
+        try:
+            addr = socket.getaddrinfo(domain, 443, socket.AF_INET)
+            if addr:
+                resolved += 1
+                log.info(f"  DNS ✓ {domain} → {addr[0][4][0]}")
+        except socket.gaierror as e:
+            log.warning(f"  DNS ✗ {domain}: {e}")
+
+    if resolved == 0:
+        log.error("❌ DNS 预检全部失败！请检查容器网络和 DNS 配置")
+        log.error("   提示：entrypoint.sh 应已覆盖 /etc/resolv.conf")
+        sys.exit(1)
+
+    log.info(f"DNS 预检通过：{resolved}/{len(test_domains)} 个域名可解析")
+
+
 def main():
     global circuit_breaker_active
 
@@ -243,6 +263,9 @@ def main():
     log.info(f"  抖动: {JITTER_PCT*100:.0f}% | 连续失败上限: {MAX_CONSEC_FAIL}")
     log.info(f"  总量上限: {'无限' if MAX_TOTAL_GB == 0 else f'{MAX_TOTAL_GB} GB'}")
     log.info("=" * 60)
+
+    # DNS 预检
+    dns_preflight()
 
     load_stats()
     stats["started_at"] = stats.get("started_at") or datetime.now(timezone.utc).isoformat()
