@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 # 配置（从环境变量注入）
 # ──────────────────────────────────────────────
 INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "30"))
-TARGET_MB = int(os.getenv("TARGET_MB", "100"))
+TARGET_MB = int(os.getenv("TARGET_MB", "1024"))
 MAX_TOTAL_GB = float(os.getenv("MAX_TOTAL_GB", "0"))
 TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "120"))
 MAX_CONSEC_FAIL = int(os.getenv("MAX_CONSEC_FAIL", "8"))
@@ -33,6 +33,9 @@ JITTER_PCT = float(os.getenv("JITTER_PCT", "0.3"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 STATS_FILE = os.getenv("STATS_FILE", "/app/data/stats.json")
 SIMULATE_HUMAN = os.getenv("SIMULATE_HUMAN", "1") == "1"
+# 下载时间窗口（小时，本地时区），格式 "START-END"，空字符串=全天运行
+# 例如 "0-6" = 凌晨 0 点到早上 6 点才下载，"22-6" = 晚上 22 点到次日早上 6 点
+SCHEDULE_HOURS = os.getenv("SCHEDULE_HOURS", "")
 
 # ──────────────────────────────────────────────
 # 官方镜像站源池（2026-06 实测验证）
@@ -253,6 +256,77 @@ def head_check(url: str) -> bool:
         return False
 
 # ──────────────────────────────────────────────
+# 时间窗口
+# ──────────────────────────────────────────────
+def parse_schedule(schedule_str: str) -> tuple[int, int] | None:
+    """解析 SCHEDULE_HOURS 字符串，返回 (start_hour, end_hour) 或 None（全天）"""
+    if not schedule_str.strip():
+        return None
+    try:
+        parts = schedule_str.strip().split("-")
+        start_h = int(parts[0])
+        end_h = int(parts[1])
+        if not (0 <= start_h <= 23 and 0 <= end_h <= 23):
+            log.error(f"❌ SCHEDULE_HOURS 小时值须在 0~23 范围，收到 {schedule_str}")
+            sys.exit(1)
+        return (start_h, end_h)
+    except Exception:
+        log.error(f"❌ SCHEDULE_HOURS 格式错误，应为 'START-END'（如 '0-6'），收到 '{schedule_str}'")
+        sys.exit(1)
+
+
+def is_in_schedule(now_hour: int, schedule: tuple[int, int] | None) -> bool:
+    """判断当前小时是否在允许的时间窗口内。支持跨午夜（如 22-6）"""
+    if schedule is None:
+        return True
+    start_h, end_h = schedule
+    if start_h == end_h:
+        return True  # 0-0 或 6-6 等价于全天
+    if start_h < end_h:
+        # 同日区间，如 0-6, 9-18
+        return start_h <= now_hour < end_h
+    else:
+        # 跨午夜区间，如 22-6 = 22~24 + 0~6
+        return now_hour >= start_h or now_hour < end_h
+
+
+def wait_for_schedule(schedule: tuple[int, int] | None):
+    """如果不在时间窗口内，计算需要等待的秒数并 sleep"""
+    if schedule is None:
+        return
+    now = datetime.now()
+    now_hour = now.hour
+    if is_in_schedule(now_hour, schedule):
+        return
+
+    start_h, end_h = schedule
+    # 计算距离窗口开始的秒数
+    if start_h < end_h:
+        # 同日区间
+        if now_hour < start_h:
+            wait_until = now.replace(hour=start_h, minute=0, second=0, microsecond=0)
+        else:
+            # now_hour >= end_h，等到明天 start_h
+            wait_until = (now.replace(hour=start_h, minute=0, second=0, microsecond=0)
+                          .replace(day=now.day + 1) if now.day < 28 else
+                          now.replace(hour=start_h, minute=0, second=0, microsecond=0))
+    else:
+        # 跨午夜区间 (如 22-6)，当前不在窗口意味着 6 <= now_hour < 22
+        wait_until = now.replace(hour=start_h, minute=0, second=0, microsecond=0)
+        if now_hour >= start_h:
+            # 不可能（已经 is_in_schedule 会返回 True），但防御
+            pass
+
+    wait_secs = max(1, int((wait_until - now).total_seconds()))
+    # 不可能精确等，每分钟醒一次检查
+    log.info(f"🕐 当前 {now_hour}:00 不在下载窗口 {start_h}-{end_h}，等待 {wait_secs//60} 分钟...")
+    for _ in range(wait_secs):
+        if not running:
+            break
+        time.sleep(1)
+
+
+# ──────────────────────────────────────────────
 # DNS 预检
 # ──────────────────────────────────────────────
 def dns_preflight():
@@ -439,11 +513,18 @@ signal.signal(signal.SIGINT, handle_signal)
 def main():
     global circuit_breaker_active
 
+    schedule = parse_schedule(SCHEDULE_HOURS)
+
     log.info("=" * 60)
     log.info("⚡ Down-Streamer v2.1 — 官方镜像站下载引擎")
     log.info(f"  间隔: {INTERVAL_SEC}s | 每轮: {TARGET_MB}MB | 超时: {TIMEOUT_SEC}s")
     log.info(f"  抖动: {JITTER_PCT*100:.0f}% | 连续失败上限: {MAX_CONSEC_FAIL}")
     log.info(f"  总量上限: {'无限' if MAX_TOTAL_GB == 0 else f'{MAX_TOTAL_GB} GB'}")
+    if schedule:
+        start_h, end_h = schedule
+        log.info(f"  下载窗口: {start_h}:00-{end_h}:00")
+    else:
+        log.info(f"  下载窗口: 全天")
     log.info(f"  源池: {len(ISO_SOURCES)} 个 ISO × 多镜像站")
     log.info("=" * 60)
 
@@ -455,6 +536,9 @@ def main():
     health_reset_counter = 0
 
     while running:
+        # 时间窗口检查
+        wait_for_schedule(schedule)
+
         # 电路中断器冷却
         if circuit_breaker_active:
             log.info(f"电路中断器激活中，等待 {circuit_breaker_cooldown}s...")
