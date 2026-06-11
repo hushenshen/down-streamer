@@ -1,7 +1,6 @@
 services:
   down-streamer:
     image: deeplakehss/down-streamer:latest
-    build: .
     container_name: down-streamer
     restart: unless-stopped
     environment:
@@ -22,8 +21,6 @@ services:
       # ─── 其他 ──────────────────────────────────
       # 日志级别：DEBUG / INFO / WARNING / ERROR
       - LOG_LEVEL=INFO
-      # 统计文件路径（映射到卷）
-      - STATS_FILE=/app/data/stats.json
       # 时区
       - TZ=Asia/Shanghai
     volumes:
@@ -41,9 +38,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    networks:
-      - default
-
-networks:
-  default:
-    driver: bridge
